@@ -1,0 +1,66 @@
+# .pre-commit-config.yml
+# Requiere: poetry add -D pre-commit ruff black mypy nbstripout detect-secrets
+
+default_language_version:
+  python: python3.10
+
+default_stages: [commit, push]
+
+repos:
+  # 1) Checks básicos de archivos
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+        exclude: |
+          (?x)^(
+            data/.*|
+            artifacts/.*
+          )$
+
+  # 2) Linter (y sorting de imports) con Ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+        types_or: [python]
+        exclude: ^notebooks/.*\.ipynb$
+
+  # 3) Formateador Black
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
+      - id: black
+        language_version: python3.10
+        exclude: ^notebooks/.*\.ipynb$
+
+  # 4) Tipado estático (mypy)
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        files: ^(pipelines|services|tests)/
+
+  # 5) Notebooks: quitar outputs para no versionarlos
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.7.1
+    hooks:
+      - id: nbstripout
+        files: ^notebooks/.*\.ipynb$
+
+  # 6) Secret scanning
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]

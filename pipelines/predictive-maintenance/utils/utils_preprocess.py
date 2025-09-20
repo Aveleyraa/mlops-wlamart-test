@@ -15,13 +15,10 @@ from sklearn.metrics import (
 from sklearn.preprocessing import OneHotEncoder
 
 
-# --------- Rutas estándar SageMaker ----------
 SM_MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
 METRICS_DIR = "/opt/ml/output/metrics"
 
-# ---------------------------
-# Load & type coercion
-# ---------------------------
+
 def load_raw_tables(
     telemetry_path: str,
     errors_path: str,
@@ -29,7 +26,22 @@ def load_raw_tables(
     failures_path: str,
     machines_path: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load raw CSVs (local or S3)."""
+    """
+    Load raw CSVs (local paths or S3 URLs) and standardize dtypes.
+
+    - Parses 'datetime' columns to pandas datetime.
+    - Casts categorical fields: errors.errorID, maint.comp, failures.failure, machines.model.
+
+    Parameters
+    ----------
+    telemetry_path, errors_path, maint_path, failures_path, machines_path : str
+        CSV locations (e.g., '/path/file.csv' or 's3://bucket/key.csv').
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
+        (telemetry, errors, maint, failures, machines)
+    """
     telemetry = pd.read_csv(telemetry_path)
     errors = pd.read_csv(errors_path)
     maint = pd.read_csv(maint_path)
@@ -54,9 +66,7 @@ def load_raw_tables(
 
     return telemetry, errors, maint, failures, machines
 
-# ---------------------------
-# Telemetry features
-# ---------------------------
+
 def build_telemetry_features(
     telemetry: pd.DataFrame,
     resample_rule: str = "3H",
@@ -64,10 +74,28 @@ def build_telemetry_features(
     signals: List[str] = ("volt", "rotate", "pressure", "vibration"),
 ) -> pd.DataFrame:
     """
-    Create telemetry features:
-      - 3H mean and std
-      - 24H rolling mean/std resampled to 3H (first value in window)
-    Output indexed by ['datetime','machineID'] with flattened columns.
+    Compute resampled and rolling telemetry features.
+
+    - Resamples each signal by `resample_rule` and computes 3H mean/std.
+    - Computes `rolling_hours` rolling mean/std, then resamples and takes the
+      first value per window.
+    - Returns a wide table (flattened columns) indexed by ['datetime','machineID'].
+
+    Parameters
+    ----------
+    telemetry : pd.DataFrame
+        Raw telemetry with columns: ['datetime', 'machineID'] + signals.
+    resample_rule : str, optional
+        Pandas offset alias for resampling (e.g., '3H').
+    rolling_hours : int, optional
+        Rolling window size (in original sampling steps) for 24H-like stats.
+    signals : List[str], optional
+        Signal column names to aggregate.
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated features: mean_3h, sd_3h, mean_24h, sd_24h per signal.
     """
     # pivot by datetime x machineID for each signal, then resample
     def _agg_3h(func_name: str) -> pd.DataFrame:
@@ -140,7 +168,7 @@ def build_telemetry_features(
     telemetry_feat = pd.concat(
         [
             telemetry_mean_3h,
-            telemetry_sd_3h.iloc[:, 2:6],   # keep only value cols (drop datetime & machineID col duplicated by concat)
+            telemetry_sd_3h.iloc[:, 2:6],
             telemetry_mean_24h.iloc[:, 2:6],
             telemetry_sd_24h.iloc[:, 2:6],
         ],
@@ -149,9 +177,7 @@ def build_telemetry_features(
 
     return telemetry_feat
 
-# ---------------------------
-# Error rolling counts
-# ---------------------------
+
 def build_error_counts(
     errors: pd.DataFrame,
     telemetry: pd.DataFrame,
@@ -159,8 +185,13 @@ def build_error_counts(
     rolling_hours: int = 24,
 ) -> pd.DataFrame:
     """
-    Build 24H rolling sum of errors per machine, resampled to 3H.
-    Returns dataframe with columns: datetime, machineID, error1count..error5count
+    Compute 24h rolling error counts per machine, resampled to `resample_rule`.
+
+    - One-hot encodes error types (1..5), aligns to the telemetry time grid,
+      fills gaps with 0, applies a `rolling_hours` sum, then resamples and takes
+      the first value per window.
+    - Returns a wide DataFrame with columns:
+      ['datetime','machineID','error1count',...,'error5count'].
     """
     error_count = pd.get_dummies(errors.set_index("datetime")).reset_index()
     error_count.columns = ["datetime", "machineID", "error1", "error2", "error3", "error4", "error5"]
@@ -193,15 +224,32 @@ def build_error_counts(
     out = out.reset_index().dropna()
     return out
 
-# ---------------------------
-# Component "age" in days
-# ---------------------------
+
+
 def build_component_age_days(
     maint: pd.DataFrame,
     telemetry: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Compute days since last replacement for comp1..comp4 per machine & datetime.
+    Compute per-machine days since last replacement for components (comp1..comp4).
+
+    - One-hot encodes maintenance events, aligns to telemetry timestamps, and
+      forward-fills the last replacement datetime per machine.
+    - Drops early records before 2015-01-01 (dataset-specific cleanup).
+    - Returns a DataFrame with ['datetime','machineID','comp1','comp2','comp3','comp4']
+      where each comp* is the age in days (float). Values are NaN if no prior replacement.
+
+    Parameters
+    ----------
+    maint : pd.DataFrame
+        Maintenance logs with ['datetime','machineID','comp'] (categorical comp1..comp4).
+    telemetry : pd.DataFrame
+        Telemetry grid used to define the time axis (must include ['datetime','machineID']).
+
+    Returns
+    -------
+    pd.DataFrame
+        Per-timestamp component ages in days.
     """
     comp_rep = pd.get_dummies(maint.set_index("datetime")).reset_index()
     comp_rep.columns = ["datetime", "machineID", "comp1", "comp2", "comp3", "comp4"]
@@ -220,7 +268,6 @@ def build_component_age_days(
         # set timestamp at replacement, else None
         comp_rep.loc[comp_rep[comp] < 1, comp] = None
         comp_rep.loc[~comp_rep[comp].isnull(), comp] = comp_rep.loc[~comp_rep[comp].isnull(), "datetime"]
-
         # forward fill last replacement date per machine
         comp_rep[comp] = comp_rep.groupby("machineID")[comp].ffill()
 
@@ -233,9 +280,6 @@ def build_component_age_days(
 
     return comp_rep
 
-# ---------------------------
-# Merge all features & label
-# ---------------------------
 def assemble_features(
     telemetry_feat: pd.DataFrame,
     error_counts: pd.DataFrame,
@@ -243,12 +287,34 @@ def assemble_features(
     machines: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Merge feature blocks and machines table into a single feature frame.
+    Merge all feature blocks with machine metadata into one matrix.
+
+    - Joins telemetry features, rolling error counts, and component ages on
+      ['datetime','machineID'].
+    - Joins machine attributes on ['machineID'].
+    - Left joins preserve the telemetry feature rows.
+
+    Parameters
+    ----------
+    telemetry_feat : pd.DataFrame
+        Base features indexed by ['datetime','machineID'].
+    error_counts : pd.DataFrame
+        Rolling error counts per ['datetime','machineID'].
+    comp_age : pd.DataFrame
+        Component ages per ['datetime','machineID'].
+    machines : pd.DataFrame
+        Machine dimension table keyed by ['machineID'].
+
+    Returns
+    -------
+    pd.DataFrame
+        Unified feature frame ready for modeling.
     """
     final_feat = telemetry_feat.merge(error_counts, on=["datetime", "machineID"], how="left")
     final_feat = final_feat.merge(comp_age, on=["datetime", "machineID"], how="left")
     final_feat = final_feat.merge(machines, on=["machineID"], how="left")
     return final_feat
+
 
 
 def label_with_failures(
@@ -257,8 +323,26 @@ def label_with_failures(
     backfill_hours: int = 7,
 ) -> pd.DataFrame:
     """
-    Label features with failure category per (machineID, datetime).
-    Performs backfill up to `backfill_hours` to propagate imminent failure label.
+    Attach failure labels to features and backfill imminent failures.
+
+    - Left-joins `failures` on ['datetime','machineID'].
+    - Backfills the 'failure' label per machine up to `backfill_hours` steps
+      (assumes an hourly grid).
+    - Casts to categorical and fills missing as 'none'.
+
+    Parameters
+    ----------
+    final_feat : pd.DataFrame
+        Feature matrix with ['datetime','machineID'].
+    failures : pd.DataFrame
+        Failure events with ['datetime','machineID','failure'].
+    backfill_hours : int, optional
+        Max backfill window (steps/hours) for imminent failures, by machine.
+
+    Returns
+    -------
+    pd.DataFrame
+        Labeled features with a categorical 'failure' column.
     """
     labeled = final_feat.merge(failures, on=["datetime", "machineID"], how="left")
 
@@ -274,18 +358,34 @@ def label_with_failures(
     labeled["failure"] = labeled["failure"].fillna("none")
     return labeled
 
-# ---------------------------
-# Splitting
-# ---------------------------
+
 def chronological_split(
     labeled_features: pd.DataFrame,
     train_cutoff: str | None,
     validate_cutoff: str | None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Split by datetime into train (< train_cutoff),
-    validate ([train_cutoff, validate_cutoff)),
-    test (> validate_cutoff). If cutoffs are None, do 70/15/15 by time.
+    Time-based split into train/validate/test.
+
+    - If both cutoffs are provided:
+        train:   datetime < train_cutoff
+        validate: train_cutoff ≤ datetime < validate_cutoff
+        test:    datetime ≥ validate_cutoff
+    - If any cutoff is None: split by time at 70%/15%/15%.
+
+    Parameters
+    ----------
+    labeled_features : pd.DataFrame
+        Input with a 'datetime' column.
+    train_cutoff : str | None
+        ISO-like timestamp for the train/validate boundary (e.g., '2015-06-01').
+    validate_cutoff : str | None
+        ISO-like timestamp for the validate/test boundary.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+        (train, validate, test) in chronological order.
     """
     df = labeled_features.sort_values("datetime")
     if train_cutoff and validate_cutoff:
@@ -310,13 +410,24 @@ def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
-# =========================
-# I/O y rutas
-# =========================
+
 def resolve_csv_path(path_or_prefix: str) -> str:
     """
-    Si recibimos un prefijo (termina con '/'), anexar 'data.csv'.
-    Si ya es .csv, devolver tal cual.
+    Resolve a path or prefix to a CSV file path.
+
+    - If the input ends with '.csv', return it as is.
+    - If the input ends with '/', append 'data.csv'.
+    - Otherwise, add a trailing '/' and then append 'data.csv'.
+
+    Parameters
+    ----------
+    path_or_prefix : str
+        File path or directory prefix.
+
+    Returns
+    -------
+    str
+        Full CSV file path.
     """
     if path_or_prefix.endswith(".csv"):
         return path_or_prefix
@@ -327,17 +438,32 @@ def resolve_csv_path(path_or_prefix: str) -> str:
 
 def load_csv(path_or_prefix: str) -> pd.DataFrame:
     """
-    Lee CSV desde S3 o local. (Para S3 requiere s3fs/pyarrow instalados).
+    Load a CSV from local or S3 (requires s3fs/pyarrow for S3) and lightly normalize dtypes.
+
+    - Resolves directory prefixes to '<prefix>/data.csv'.
+    - Parses 'datetime' to pandas datetime if present.
+    - Casts 'model' and 'failure' to categorical if present.
+
+    Parameters
+    ----------
+    path_or_prefix : str
+        File path or directory/prefix (local or s3://).
+
+    Returns
+    -------
+    pd.DataFrame
+        Loaded DataFrame with normalized dtypes.
     """
     path = resolve_csv_path(path_or_prefix)
     df = pd.read_csv(path)
-    # normalizaciones suaves para tipos comunes
+
     if "datetime" in df.columns:
         df["datetime"] = pd.to_datetime(df["datetime"])
-    # mantener categóricas como category (útil para OHE limpio)
+
     for cat_col in ("model", "failure"):
         if cat_col in df.columns and not pd.api.types.is_categorical_dtype(df[cat_col]):
             df[cat_col] = df[cat_col].astype("category")
+
     return df
 
 
@@ -354,6 +480,21 @@ def save_split_csv(
     test_dir: str,
     filename: str = "data.csv",
 ) -> None:
+    """
+    Save train/validate/test DataFrames to CSV files.
+
+    - Ensures output directories exist (via `ensure_dir`).
+    - Writes each split to `<dir>/<filename>` without index.
+
+    Parameters
+    ----------
+    train, validate, test : pd.DataFrame
+        Data splits to persist.
+    train_dir, validate_dir, test_dir : str
+        Target directories for each split.
+    filename : str, optional
+        CSV filename to use in each directory (default: 'data.csv').
+    """
     ensure_dir(train_dir)
     ensure_dir(validate_dir)
     ensure_dir(test_dir)
@@ -362,16 +503,27 @@ def save_split_csv(
     test.to_csv(os.path.join(test_dir, filename), index=False)
 
 
-# =========================
-# Features/Target helpers
-# =========================
 def split_X_y(
     df: pd.DataFrame,
     target_col: str,
     drop_cols: Tuple[str, ...] = ("datetime", "machineID"),
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Separa X e y eliminando columnas de ID/tiempo si aparecen.
+    Split features (X) and target (y), dropping common ID/time columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame.
+    target_col : str
+        Name of the target column.
+    drop_cols : Tuple[str, ...], optional
+        Columns to exclude from features (default: ('datetime','machineID')).
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.Series]
+        X (features) and y (target).
     """
     feats = [c for c in df.columns if c not in set(drop_cols + (target_col,))]
     X = df[feats].copy()
