@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main, develop ]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10"]   # ajusta o agrega 3.11/3.9 si quieres matriz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "poetry"          # cache de dependencias administradas por Poetry
+
+      - name: Install Poetry
+        run: pipx install poetry==1.8.3
+
+      - name: Install dependencies (incluye dev)
+        run: |
+          poetry config virtualenvs.create false
+          poetry install --no-interaction --no-ansi --with dev
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (black)
+        run: black --check .
+
+      - name: Type check (mypy)
+        run: mypy src
+
+      - name: Tests (pytest + coverage)
+        run: pytest -q --maxfail=1 --disable-warnings --cov=src --cov-report=xml
+
+      - name: Build wheel/sdist
+        run: poetry build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

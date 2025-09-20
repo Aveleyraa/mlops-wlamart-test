@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infrastructure with a Lambda that triggers GitHub predictive-maintenance
+
+Parameters:
+  GitLabToken:
+    Type: String
+    NoEcho: true
+    Description: GitLab personal access token
+
+  GitLabProject:
+    Type: String
+    Description: predictive-maintenance
+
+  GitLabBranch:
+    Type: String
+    Default: "prod"
+    Description: Pipeline branch
+
+  CompanyName:
+    Type: String
+    Description: Indicate the company name.
+
+  ProjectName:
+    Type: String
+    Description: Indicate the name of project to build the resources.
+
+  Environment:
+    Type: String
+    Description: Indicates the name of the environment for which the infrastructure will be provisioned [dev/qa/prod].
+
+  RawBucket:
+    Type: String
+    Description: S3 bucket name (raw zone)
+
+  StagingBucket:
+    Type: String
+    Description: S3 bucket name (staging zone)
+
+  ModelBucket:
+    Type: String
+    Description: S3 bucket name (model zone)
+
+  ArtifactsBucket:
+    Description: Bucket name for artifacts
+    Type: String
+
+Resources:
+
+  AmazonSageMakerServiceCatalogProductsUseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AmazonSageMakerServiceCatalogProductsUseRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3ModelAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowModelDataReadWrite
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ModelBucket}"
+                  - !Sub "arn:aws:s3:::${ModelBucket}/*"
+                  - !Sub "arn:aws:s3:::${StagingBucket}/*"
+              - Sid: Statement1
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${StagingBucket}/*"
+                  - !Sub "arn:aws:s3:::${RawBucket}/*"
+                  - !Sub "arn:aws:s3:::${ModelBucket}/*"
+              - Sid: AllowDynamoDBWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/StatusAnalisis"
+
+  InputDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RawBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: master-routes-trigger/
+                  - Name: suffix
+                    Value: .csv
+            Function: !GetAtt TriggerGitLabWorkflowFunction.Arn
+
+  StagingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref StagingBucket
+
+  ModelDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ModelBucket
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaGitLabTriggerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${RawBucket}/input-model/*"
+
+  TriggerGitLabWorkflowFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TriggerGitLabPipeline
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          GITLAB_TOKEN: !Ref GitLabToken
+          GITLAB_PROJECT: !Ref GitLabProject
+          GITLAB_BRANCH: !Ref GitLabBranch
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib3
+          import urllib.parse
+
+          def lambda_handler(event, context):
+              print("📥 Event received:")
+              print(json.dumps(event, indent=2))
+
+              try:
+                  if 'Records' not in event or len(event['Records']) == 0:
+                      print("⚠️ No records found in the event (no Records).")
+                      return {
+                          "statusCode": 400,
+                          "body": "Event does not contain S3 records."
+                      }
+
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+                  print(f"✅ File detected in S3: Bucket = {bucket}, Key = {key}")
+
+                  s3_uri = f"s3://{bucket}/{key}"
+                  print(f"📦 S3 URI: {s3_uri}")
+
+                  token = os.environ['GITLAB_TOKEN']
+                  project = os.environ['GITLAB_PROJECT']
+                  branch = os.environ['GITLAB_BRANCH']
+
+                  url = f"https://gitlab.xalcloud.com/api/v4/projects/837/trigger/pipeline"
+                  print(f"🚀 GitLab API URL: {url}")
+
+                  fields = {
+                      'token': token,
+                      'ref': branch,
+                      'variables[INPUT_DATA_URL]': s3_uri
+                  }
+
+                  safe_fields = fields.copy()
+                  safe_fields['token'] = '****' + token[-4:] if len(token) > 4 else '****'
+                  print(f"Request fields: {json.dumps(safe_fields, indent=2)}")
+
+                  http = urllib3.PoolManager()
+                  r = http.request(
+                      'POST',
+                      url,
+                      fields=fields
+                  )
+
+                  print(f"🎯 GitLab Response Status: {r.status}")
+                  print(f"Response Headers: {dict(r.headers)}")
+                  print(f"Response Body: {r.data.decode()}")
+
+                  return {
+                      "statusCode": r.status,
+                      "body": r.data.decode()
+                  }
+
+              except Exception as e:
+                  print(f"❌ Error: {str(e)}")
+                  import traceback
+                  print(f"Traceback: {traceback.format_exc()}")
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerGitLabWorkflowFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${RawBucket}"
+
+Outputs:
+  InputDataBucket:
+    Value: !Ref InputDataBucket
+
+  StagingDataBucket:
+    Value: !Ref StagingDataBucket
+
+  ModelDataBucket:
+    Value: !Ref ModelDataBucket
+
+  LambdaFunction:
+    Value: !Ref TriggerGitLabWorkflowFunction

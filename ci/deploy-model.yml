@@ -1,0 +1,190 @@
+name: Deploy SageMaker Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region"
+        required: true
+        default: "us-east-2"
+      model_package_group_name:
+        description: "SageMaker Model Package Group"
+        required: true
+      approval_status:
+        description: "Only deploy models with this approval status"
+        required: true
+        default: "Approved"
+      endpoint_name:
+        description: "SageMaker Endpoint name (stable alias)"
+        required: true
+      instance_type:
+        description: "Instance type for production variant"
+        required: true
+        default: "ml.m5.xlarge"
+      initial_instance_count:
+        description: "Number of instances"
+        required: true
+        default: "1"
+
+  workflow_run:
+    workflows: ["Train SageMaker Pipeline"]
+    types: [completed]
+
+permissions:
+  contents: read
+  id-token: write   # necesario para OIDC
+
+concurrency:
+  group: deploy-model-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ inputs.aws_region || 'us-east-2' }}
+      MODEL_PACKAGE_GROUP_NAME: ${{ inputs.model_package_group_name }}
+      APPROVAL_STATUS: ${{ inputs.approval_status || 'Approved' }}
+      ENDPOINT_NAME: ${{ inputs.endpoint_name }}
+      INSTANCE_TYPE: ${{ inputs.instance_type || 'ml.m5.xlarge' }}
+      INITIAL_INSTANCE_COUNT: ${{ inputs.initial_instance_count || '1' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Configura credenciales mediante OIDC (sin usar keys largas).
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}   # arn:aws:iam::<acct>:role/<GithubOIDCRole>
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deploy deps
+        run: |
+          python -m pip install -U pip
+          pip install boto3 sagemaker
+
+      - name: Deploy latest Approved model from Model Registry
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, sys, time, json, datetime, uuid
+          import boto3
+          from botocore.exceptions import ClientError
+
+          region        = os.environ["AWS_REGION"]
+          group_name    = os.environ["MODEL_PACKAGE_GROUP_NAME"]
+          approval      = os.environ["APPROVAL_STATUS"]
+          endpoint_name = os.environ["ENDPOINT_NAME"]
+          instance_type = os.environ["INSTANCE_TYPE"]
+          instance_count = int(os.environ["INITIAL_INSTANCE_COUNT"])
+
+          sm = boto3.client("sagemaker", region_name=region)
+
+          # 1) Obtener el último ModelPackage con el estado de aprobación solicitado
+          def latest_approved_model_package(group: str, status: str) -> str:
+            paginator = sm.get_paginator("list_model_packages")
+            it = paginator.paginate(
+              ModelPackageGroupName=group,
+              ModelApprovalStatus=status,
+              SortBy="CreationTime",
+              SortOrder="Descending",
+            )
+            for page in it:
+              pkgs = page.get("ModelPackageSummaryList", [])
+              if pkgs:
+                return pkgs[0]["ModelPackageArn"]
+            raise RuntimeError(f"No {status} model packages found in group '{group}'")
+
+          model_package_arn = latest_approved_model_package(group_name, approval)
+          print(f"✅ Latest {approval} ModelPackageArn: {model_package_arn}")
+
+          # 2) Crear Model que referencia al Model Package
+          ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+          unique = uuid.uuid4().hex[:8]
+          model_name = f"{endpoint_name}-{ts}-{unique}"
+          print(f"🧩 Creating SageMaker Model: {model_name}")
+
+          # Opción A: referencia directa al ModelPackageArn en Containers
+          # (SageMaker extrae image/env del package)
+          try:
+            sm.create_model(
+              ModelName=model_name,
+              Containers=[{"ModelPackageName": model_package_arn}],
+              ExecutionRoleArn=os.environ.get("SAGEMAKER_INFERENCE_ROLE_ARN", ""),  # opcional si el package ya define permiso
+              Tags=[
+                {"Key":"project", "Value": endpoint_name},
+                {"Key":"model-package-group", "Value": group_name},
+              ],
+            )
+          except ClientError as e:
+            if e.response["Error"]["Code"] == "ValidationException" and "Model already exists" in str(e):
+              print("ℹ️ Model already exists, continuing.")
+            else:
+              raise
+
+          # 3) Crear EndpointConfig
+          endpoint_config_name = f"{endpoint_name}-cfg-{ts}-{unique}"
+          print(f"⚙️ Creating EndpointConfig: {endpoint_config_name}")
+
+          sm.create_endpoint_config(
+            EndpointConfigName=endpoint_config_name,
+            ProductionVariants=[
+              {
+                "VariantName": "AllTraffic",
+                "ModelName": model_name,
+                "InitialInstanceCount": instance_count,
+                "InstanceType": instance_type,
+                "InitialVariantWeight": 1.0,
+              }
+            ],
+            Tags=[
+              {"Key":"project", "Value": endpoint_name},
+              {"Key":"deployment-time", "Value": ts},
+            ],
+          )
+
+          # 4) Crear o actualizar Endpoint
+          def endpoint_exists(name: str) -> bool:
+            try:
+              sm.describe_endpoint(EndpointName=name)
+              return True
+            except ClientError as e:
+              if e.response["Error"]["Code"] == "ValidationException":
+                return False
+              raise
+
+          if endpoint_exists(endpoint_name):
+            print(f"🔄 Updating endpoint: {endpoint_name}")
+            sm.update_endpoint(
+              EndpointName=endpoint_name,
+              EndpointConfigName=endpoint_config_name
+            )
+          else:
+            print(f"🚀 Creating endpoint: {endpoint_name}")
+            sm.create_endpoint(
+              EndpointName=endpoint_name,
+              EndpointConfigName=endpoint_config_name,
+              Tags=[{"Key":"project","Value": endpoint_name}],
+            )
+
+          # 5) Esperar a InService
+          print("⏳ Waiting for endpoint to be InService...")
+          waiter = sm.get_waiter("endpoint_in_service")
+          waiter.wait(EndpointName=endpoint_name)
+          desc = sm.describe_endpoint(EndpointName=endpoint_name)
+          status = desc["EndpointStatus"]
+          print(f"🎉 Endpoint status: {status}")
+          print(json.dumps({
+            "endpoint_name": endpoint_name,
+            "endpoint_status": status,
+            "endpoint_config_name": endpoint_config_name,
+            "model_name": model_name,
+            "model_package_arn": model_package_arn
+          }, indent=2))
+          PY

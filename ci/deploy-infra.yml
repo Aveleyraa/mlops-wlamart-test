@@ -1,0 +1,105 @@
+name: Deploy Infra
+
+on:
+
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Ambiente (dev/prod/…)"
+        required: true
+        default: "dev"
+      aws_region:
+        description: "AWS Region"
+        required: true
+        default: "us-east-2"
+      stack_name:
+        description: "CloudFormation Stack Name"
+        required: true
+        default: "predictive-maintenance"
+      role_to_assume:
+        description: "ARN del rol a asumir (si no usas el secret)"
+        required: false
+        default: ""
+
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: deploy-infra-${{ github.ref_name }}-${{ inputs.env || 'dev' }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write   # necesario para OIDC
+  contents: read
+
+jobs:
+  deploy-infra:
+
+    if: ${{ github.ref_name != 'no-ejecutar' }}
+    runs-on: ubuntu-latest
+    env:
+      ENV: ${{ inputs.env || 'dev' }}
+      AWS_REGION: ${{ inputs.aws_region || 'us-east-2' }}
+      STACK_NAME: ${{ inputs.stack_name || 'predictive-maintenance-infra' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+
+          role-to-assume: ${{ inputs.role_to_assume != '' && inputs.role_to_assume || secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: gha-deploy-infra
+
+
+      - name: Setup AWS CLI
+        uses: aws-actions/setup-aws-cli@v2
+
+      - name: Who am I?
+        run: aws sts get-caller-identity
+
+      - name: Generar parámetros desde JSON
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Construye "Key=Value Key2=Value2 ..." desde infra/parameters_${ENV}.json
+          if [[ ! -f "infra/parameters_${ENV}.json" ]]; then
+            echo "No existe infra/parameters_${ENV}.json"; exit 1
+          fi
+
+          PARAMS=$(jq -r '.[] | "\(.ParameterKey)=\(.ParameterValue)"' infra/parameters_${ENV}.json | paste -sd " ")
+          
+          # Verifica token (equivalente a GITLAB_PIPELINE_TRIGGER_TOKEN). 
+          # Crea un secret llamado DEPLOY_TRIGGER_TOKEN o cambia el nombre aquí.
+          if [[ -z "${{ secrets.DEPLOY_TRIGGER_TOKEN }}" ]]; then
+            echo "❌ Falta el secret DEPLOY_TRIGGER_TOKEN"; exit 1
+          else
+            echo "✅ Token presente (oculto)"
+          fi
+
+          # Mantengo los nombres de parámetros para no tocar tu template:
+          # GitLabToken / GitLabProject / GitLabBranch
+          # (Si prefieres, cámbialos en el template y aquí a GitHubToken/Repo/Branch)
+          PARAMS="$PARAMS GitLabToken=${{ secrets.DEPLOY_TRIGGER_TOKEN }} GitLabProject=${GITHUB_REPOSITORY} GitLabBranch=${GITHUB_REF_NAME}"
+
+          echo "Parámetros finales:"
+          tr ' ' '\n' <<< "$PARAMS"
+
+          # Exporta a outputs del step
+          echo "params=$PARAMS" >> "$GITHUB_OUTPUT"
+
+      - name: Desplegar CloudFormation
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws cloudformation deploy \
+            --template-file infra/cloudformation.yml \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides ${{ steps.params.outputs.params }} \
+            --no-fail-on-empty-changeset \
+            --region "${AWS_REGION}"

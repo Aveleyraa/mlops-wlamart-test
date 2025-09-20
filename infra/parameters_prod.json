@@ -1,0 +1,38 @@
+[
+    {
+        "ParameterKey": "CompanyName",
+        "ParameterValue": "walmart"
+    },
+    {
+        "ParameterKey": "ProjectName",
+        "ParameterValue": "predictive-maintenance"
+    },
+    {
+        "ParameterKey": "Environment",
+        "ParameterValue": "prod"
+    },
+    {
+        "ParameterKey": "Region",
+        "ParameterValue": "us-east-2"
+    },
+    {
+        "ParameterKey": "RawBucket",
+        "ParameterValue": "walmart-predictive-maintenance-prod-raw-data"
+    },
+    {
+        "ParameterKey": "StagingBucket",
+        "ParameterValue": "walmart-predictive-maintenance-prod-staging-data"
+    },
+    {
+        "ParameterKey": "ModelBucket",
+        "ParameterValue": "walmart-predictive-maintenance-prod-model-data"
+    },
+    {
+        "ParameterKey": "ArtifactsBucket",
+        "ParameterValue": "walmart-predictive-maintenance-prod-s3-artifacts"
+    },
+    {
+        "ParameterKey": "BucketPaths",
+        "ParameterValue": "analytic/utilities"
+    }
+]
