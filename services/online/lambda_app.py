@@ -5,6 +5,26 @@ from pipelines.predictive_maintenance.features.online_fe import (
     features_from_raw_window,
     load_feature_order,
 )
+import time 
+from pipelines.predictive_maintenance.utils.utils_logging import get_logger
+logger = get_logger("lambda")
+
+def put_emf_metric(name: str, value: float, unit: str = "Milliseconds"):
+    metric = {
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": "PDM",
+                "Dimensions": [["Function"]],
+                "Metrics": [{"Name": name, "Unit": unit}]
+            }]
+        },
+        "Function": "batch-inference",
+        name: value
+    }
+    print(json.dumps(metric))  # EMF
+
+
 
 REGION = os.environ.get("AWS_REGION", "us-east-2")
 ENDPOINT_NAME = os.environ["SM_ENDPOINT_NAME"]
@@ -41,7 +61,9 @@ def handler(event, context):
     Devuelve predicciones del endpoint.
     """
     _load_feature_order_once()
-
+    t0 = time.time()
+    logger.info("Event received", extra={"keys": list(event.keys())})
+    
     if isinstance(event, str):
         event = json.loads(event)
 
@@ -69,4 +91,5 @@ def handler(event, context):
         Body=body,
     )
     preds = json.loads(resp["Body"].read().decode("utf-8"))
+    put_emf_metric("BatchDurationMs", (time.time() - t0)*1000)
     return {"statusCode": 200, "predictions": preds}

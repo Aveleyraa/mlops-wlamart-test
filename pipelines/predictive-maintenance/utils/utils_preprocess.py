@@ -13,7 +13,16 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.preprocessing import OneHotEncoder
+from pipelines.predictive_maintenance.utils.utils_logging import get_logger, log_timing
+logger = get_logger(__name__)
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    rid = str(uuid.uuid4())
+    logger.info("Request received", extra={"path": str(request.url.path), "rid": rid})
+    response = await call_next(request)
+    logger.info("Request done", extra={"status": response.status_code, "rid": rid})
+    return response
 
 SM_MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
 METRICS_DIR = "/opt/ml/output/metrics"
@@ -63,7 +72,7 @@ def load_raw_tables(
         failures["failure"] = failures["failure"].astype("category")
     if "model" in machines.columns:
         machines["model"] = machines["model"].astype("category")
-
+    logger.info("Loaded tables", extra={"rows": {"telemetry": len(telemetry)}})
     return telemetry, errors, maint, failures, machines
 
 
@@ -114,6 +123,7 @@ def build_telemetry_features(
         suffix = "mean_3h" if func_name == "mean" else "sd_3h"
         out.columns = [f"{s}{suffix}" for s in signals]
         out = out.reset_index()
+        logger.info("Concatenated features")
         return out
 
     telemetry_mean_3h = _agg_3h("mean")
@@ -163,7 +173,7 @@ def build_telemetry_features(
     telemetry_sd_3h = pd.concat(frames, axis=1)
     telemetry_sd_3h.columns = [f"{s}sd_3h" for s in signals]
     telemetry_sd_3h = telemetry_sd_3h.reset_index()
-
+    logger.info("Finished 3H std (not rolling)")
     # merge feature blocks
     telemetry_feat = pd.concat(
         [
@@ -174,7 +184,7 @@ def build_telemetry_features(
         ],
         axis=1,
     ).dropna()
-
+    logger.info("Finished merge feature blocks")
     return telemetry_feat
 
 
@@ -222,6 +232,7 @@ def build_error_counts(
     out = pd.concat(frames, axis=1)
     out.columns = [f"{c}count" for c in fields]
     out = out.reset_index().dropna()
+    logger.info("DataFrame with columns:['datetime','machineID','error1count',...,'error5count'")
     return out
 
 
@@ -277,7 +288,7 @@ def build_component_age_days(
     # days since last replacement
     for comp in components:
         comp_rep[comp] = (comp_rep["datetime"] - comp_rep[comp]) / np.timedelta64(1, "D")
-
+    logger.info("Per-timestamp component ages in days")
     return comp_rep
 
 def assemble_features(
@@ -313,6 +324,7 @@ def assemble_features(
     final_feat = telemetry_feat.merge(error_counts, on=["datetime", "machineID"], how="left")
     final_feat = final_feat.merge(comp_age, on=["datetime", "machineID"], how="left")
     final_feat = final_feat.merge(machines, on=["machineID"], how="left")
+    logger.info("Unified feature frame ready for modeling")
     return final_feat
 
 
@@ -356,6 +368,7 @@ def label_with_failures(
     labeled["failure"] = labeled["failure"].astype("category")
     labeled["failure"] = labeled["failure"].cat.add_categories("none")
     labeled["failure"] = labeled["failure"].fillna("none")
+    logger.info("Labeled features with a categorical 'failure' column")
     return labeled
 
 
@@ -463,7 +476,7 @@ def load_csv(path_or_prefix: str) -> pd.DataFrame:
     for cat_col in ("model", "failure"):
         if cat_col in df.columns and not pd.api.types.is_categorical_dtype(df[cat_col]):
             df[cat_col] = df[cat_col].astype("category")
-
+    logger.info("Loaded DataFrame with normalized dtypes")
     return df
 
 
@@ -501,6 +514,7 @@ def save_split_csv(
     train.to_csv(os.path.join(train_dir, filename), index=False)
     validate.to_csv(os.path.join(validate_dir, filename), index=False)
     test.to_csv(os.path.join(test_dir, filename), index=False)
+    logger.info("CSV filename to use in each directory")
 
 
 def split_X_y(
@@ -528,5 +542,6 @@ def split_X_y(
     feats = [c for c in df.columns if c not in set(drop_cols + (target_col,))]
     X = df[feats].copy()
     y = df[target_col].copy()
+    logger.info("slplit Tuple[pd.DataFrame, pd.Series]")
     return X, y
 

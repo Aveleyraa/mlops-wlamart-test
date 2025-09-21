@@ -1,9 +1,21 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os, json, boto3, pandas as pd
+import uuid
+from fastapi import FastAPI, Request
 from pipelines.predictive_maintenance.features.online_fe import (
     features_from_already_aggregated, features_from_raw_window, load_feature_order
 )
+from pipelines.predictive_maintenance.utils.utils_logging import get_logger
+logger = get_logger("fastapi")
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    rid = str(uuid.uuid4())
+    logger.info("Request received", extra={"path": str(request.url.path), "rid": rid})
+    response = await call_next(request)
+    logger.info("Request done", extra={"status": response.status_code, "rid": rid})
+    return response
 
 app = FastAPI()
 REGION = os.environ.get("AWS_REGION", "us-east-2")

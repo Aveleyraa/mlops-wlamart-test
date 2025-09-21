@@ -1,0 +1,86 @@
+# --- Python bytecode / cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- C extensions ---
+*.so
+
+# --- Distribución / empaquetado ---
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# --- Entornos virtuales / env vars ---
+.venv/
+venv/
+env/
+.env/
+.env.*
+.conda/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# --- Tests / cobertura ---
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Tipado / linters ---
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+
+# --- IDE / editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- SO / varios ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+logs/
+*.log
+
+# --- MLflow (ignora si usas tracking remoto; elimina si quieres versionar local) ---
+mlruns/
+
+# --- Datos y artefactos grandes ---
+data/
+!data/README.md
+!data/*.sample.*
+!data/*.example.*
+
+# --- Salidas / modelos / artefactos de entrenamiento ---
+output/
+outputs/
+artifacts/
+models/
+checkpoints/
+**/output/
+**/outputs/
+**/artifacts/
+**/models/
+**/checkpoints/
+
+# --- Docker ---
+*.pid
+*.seed
+*.tar
+*.img
+
+# --- Claves y certificados ---
+*.pem
+*.key
+*.crt
