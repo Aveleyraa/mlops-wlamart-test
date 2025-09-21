@@ -163,7 +163,7 @@ An evaluation.json under the model’s output/metrics/ prefix.
 
 A new Model Package in the Model Registry for model_package_group_name = walmart-pdm-<env>.
 
-## 🧭 Training Pipeline (SageMaker)
+## Training Pipeline (SageMaker)
 
 `pipelines/predictive-maintenance/pipeline.py` defines:
 
@@ -180,7 +180,7 @@ A new Model Package in the Model Registry for model_package_group_name = walmart
 
 
 
-## 🚢 Model Deployment (Online Endpoint)
+## Model Deployment (Online Endpoint)
 
 Once a model is approved/registered:
 
